@@ -4,6 +4,7 @@ use std::ops::Div;
 use base64::Engine;
 use futures::{future, FutureExt, TryFutureExt};
 use num::rational::Ratio;
+use url::Url;
 
 use crate::constants::{
     BASE64, CREDITS_THRESHOLD_COEF, META_RESOURCE_NAME, PLAYER_IGNORE_SEEK_AFTER,
@@ -17,7 +18,7 @@ use crate::models::common::{
 };
 use crate::models::ctx::{Ctx, CtxError};
 use crate::runtime::msg::{Action, ActionLoad, ActionPlayer, Event, Internal, Msg};
-use crate::runtime::{Effect, EffectFuture, Effects, Env, EnvFutureExt, UpdateWithCtx};
+use crate::runtime::{Effect, EffectFuture, Effects, Env, EnvError, EnvFutureExt, UpdateWithCtx};
 use crate::types::addon::{AggrRequest, Descriptor, ExtraExt, ResourcePath, ResourceRequest};
 use crate::types::api::{
     fetch_api, APIRequest, APIResult, SeekLog, SeekLogRequest, SkipGapsRequest, SkipGapsResponse,
@@ -25,9 +26,14 @@ use crate::types::api::{
 };
 use crate::types::library::{LibraryBucket, LibraryItem};
 use crate::types::player::{IntroData, IntroOutro};
-use crate::types::profile::{Profile, Settings as ProfileSettings};
-use crate::types::resource::{MetaItem, SeriesInfo, Stream, StreamSource, Subtitles, Video};
-use crate::types::streams::{StreamItemState, StreamsBucket, StreamsItemKey};
+use crate::types::profile::{AuthKey, Profile};
+use crate::types::rating::{Rating, RatingSendRequest, RatingSendResponse};
+use crate::types::resource::{
+    MetaItem, SeriesInfo, Stream, StreamSource, StreamUrls, Subtitles, Video,
+};
+use crate::types::streams::{
+    ConvertedStreamSource, StreamItemState, StreamsBucket, StreamsItemKey,
+};
 
 use stremio_watched_bitfield::WatchedBitField;
 
@@ -96,6 +102,7 @@ pub struct Player {
     pub next_video: Option<Video>,
     pub next_streams: Option<ResourceLoadable<Vec<Stream>>>,
     pub next_stream: Option<Stream>,
+    pub stream: Option<Loadable<(StreamUrls, Stream<ConvertedStreamSource>), EnvError>>,
     pub series_info: Option<SeriesInfo>,
     pub library_item: Option<LibraryItem>,
     pub stream_state: Option<StreamItemState>,
@@ -131,6 +138,15 @@ impl<E: Env + 'static> UpdateWithCtx<E> for Player {
     fn update(&mut self, msg: &Msg, ctx: &Ctx) -> Effects {
         match msg {
             Msg::Action(Action::Load(ActionLoad::Player(selected))) => {
+                // make sure we send the correct Trakt event if the model hasn't been unloaded
+                let trakt_event_effects = if self.selected.is_some() {
+                    Effects::msg(Msg::Event(Event::TraktPaused {
+                        context: self.analytics_context.as_ref().cloned().unwrap_or_default(),
+                    }))
+                    .unchanged()
+                } else {
+                    Effects::none().unchanged()
+                };
                 let item_state_update_effects = if self
                     .selected
                     .as_ref()
@@ -173,10 +189,18 @@ impl<E: Env + 'static> UpdateWithCtx<E> for Player {
                 };
                 let stream_state_effects = eq_update(&mut self.stream_state, None);
                 let video_params_effects = eq_update(&mut self.video_params, None);
+
+                let stream_effects = stream_update(
+                    &mut self.stream,
+                    self.selected.as_ref(),
+                    &ctx.profile.settings.streaming_server_url,
+                );
+
                 let subtitles_effects = subtitles_update::<E>(
                     &mut self.subtitles,
                     &self.selected,
                     &self.video_params,
+                    self.stream.as_ref(),
                     &ctx.profile.addons,
                 );
                 let next_video_effects = next_video_update(
@@ -184,19 +208,14 @@ impl<E: Env + 'static> UpdateWithCtx<E> for Player {
                     &self.next_stream,
                     &self.selected,
                     &self.meta_item,
-                    &ctx.profile.settings,
                 );
                 let next_streams_effects = next_streams_update::<E>(
                     &mut self.next_streams,
                     &self.next_video,
                     &self.selected,
                 );
-                let next_stream_effects = next_stream_update(
-                    &mut self.next_stream,
-                    &self.next_streams,
-                    &self.selected,
-                    &ctx.profile.settings,
-                );
+                let next_stream_effects =
+                    next_stream_update(&mut self.next_stream, &self.next_streams, &self.selected);
                 // Make sure to update the steams and in term the StreamsBucket
                 // once the player loads the newly selected item
                 let update_streams_effects = match (&self.selected, &self.meta_item) {
@@ -219,8 +238,11 @@ impl<E: Env + 'static> UpdateWithCtx<E> for Player {
                     &ctx.library,
                 );
 
-                let library_item_state_effects =
-                    library_item_state_update(&mut self.library_item, &self.selected);
+                let library_item_state_effects = library_item_state_update(
+                    &mut self.library_item,
+                    self.next_video.as_ref(),
+                    &self.selected,
+                );
 
                 let watched_effects =
                     watched_update(&mut self.watched, &self.meta_item, &self.library_item);
@@ -272,11 +294,13 @@ impl<E: Env + 'static> UpdateWithCtx<E> for Player {
                 self.loaded = false;
                 self.ended = false;
                 self.paused = None;
-                item_state_update_effects
+                trakt_event_effects
+                    .join(item_state_update_effects)
                     .join(selected_effects)
                     .join(meta_item_effects)
                     .join(stream_state_effects)
                     .join(video_params_effects)
+                    .join(stream_effects)
                     .join(subtitles_effects)
                     .join(next_video_effects)
                     .join(next_streams_effects)
@@ -291,6 +315,15 @@ impl<E: Env + 'static> UpdateWithCtx<E> for Player {
                     .join(notification_effects)
             }
             Msg::Action(Action::Unload) => {
+                let trakt_event_effects = if self.selected.is_some() {
+                    Effects::msg(Msg::Event(Event::TraktPaused {
+                        context: self.analytics_context.as_ref().cloned().unwrap_or_default(),
+                    }))
+                    .unchanged()
+                } else {
+                    Effects::none().unchanged()
+                };
+
                 let ended_effects = if !self.ended && self.selected.is_some() {
                     Effects::msg(Msg::Event(Event::PlayerStopped {
                         context: self.analytics_context.as_ref().cloned().unwrap_or_default(),
@@ -323,6 +356,7 @@ impl<E: Env + 'static> UpdateWithCtx<E> for Player {
                 let video_params_effects = eq_update(&mut self.video_params, None);
                 let meta_item_effects = eq_update(&mut self.meta_item, None);
                 let stream_state_effects = eq_update(&mut self.stream_state, None);
+                let stream_effects = eq_update(&mut self.stream, None);
                 let subtitles_effects = eq_update(&mut self.subtitles, vec![]);
                 let next_video_effects = eq_update(&mut self.next_video, None);
                 let next_streams_effects = eq_update(&mut self.next_streams, None);
@@ -337,11 +371,13 @@ impl<E: Env + 'static> UpdateWithCtx<E> for Player {
                 self.ended = false;
                 self.paused = None;
 
-                seek_history_effects
+                trakt_event_effects
+                    .join(seek_history_effects)
                     .join(item_state_update_effects)
                     .join(push_to_library_effects)
                     .join(selected_effects)
                     .join(video_params_effects)
+                    .join(stream_effects)
                     .join(meta_item_effects)
                     .join(stream_state_effects)
                     .join(subtitles_effects)
@@ -357,10 +393,12 @@ impl<E: Env + 'static> UpdateWithCtx<E> for Player {
             Msg::Action(Action::Player(ActionPlayer::VideoParamsChanged { video_params })) => {
                 let video_params_effects =
                     eq_update(&mut self.video_params, video_params.to_owned());
+
                 let subtitles_effects = subtitles_update::<E>(
                     &mut self.subtitles,
                     &self.selected,
                     &self.video_params,
+                    self.stream.as_ref(),
                     &ctx.profile.addons,
                 );
                 let skip_gaps_effects = skip_gaps_update::<E>(
@@ -452,8 +490,19 @@ impl<E: Env + 'static> UpdateWithCtx<E> for Player {
 
                     let push_to_library_effects =
                         push_to_library::<E>(&mut self.push_library_item_time, library_item);
+                    let intro_outro_effects = intro_outro_update::<E>(
+                        &mut self.intro_outro,
+                        &ctx.profile,
+                        self.selected.as_ref(),
+                        self.video_params.as_ref(),
+                        self.series_info.as_ref(),
+                        Some(library_item),
+                        &mut self.skip_gaps,
+                    );
 
-                    trakt_event_effects.join(push_to_library_effects)
+                    trakt_event_effects
+                        .join(push_to_library_effects)
+                        .join(intro_outro_effects)
                 }
                 _ => Effects::none().unchanged(),
             },
@@ -504,7 +553,8 @@ impl<E: Env + 'static> UpdateWithCtx<E> for Player {
                         duration.clone_into(&mut library_item.state.duration);
                     }
 
-                    if library_item.state.flagged_watched == 0
+                    // Watched threshold for marking an episode/movie as watched
+                    let should_send_watched = if library_item.state.flagged_watched == 0
                         && library_item.state.time_watched as f64
                             > library_item.state.duration as f64 * WATCHED_THRESHOLD_COEF
                     {
@@ -516,7 +566,33 @@ impl<E: Env + 'static> UpdateWithCtx<E> for Player {
                             watched_bit_field.set_video(video_id, true);
                             library_item.state.watched = Some(watched_bit_field.into());
                         }
-                    }
+
+                        true
+                    } else {
+                        false
+                    };
+
+                    // send Watched for MetaDetail id
+                    // single episode should mark the item as watched.
+                    let send_watched_effects = match (
+                        should_send_watched,
+                        ctx.profile.auth_key(),
+                        self.selected.as_ref(),
+                    ) {
+                        (
+                            true,
+                            Some(auth_key),
+                            Some(Selected {
+                                meta_request:
+                                    Some(ResourceRequest {
+                                        path: meta_path, ..
+                                    }),
+                                ..
+                            }),
+                        ) => Effects::one(send_watched::<E>(auth_key.to_owned(), meta_path))
+                            .unchanged(),
+                        _ => Effects::none().unchanged(),
+                    };
 
                     if library_item.temp && library_item.state.times_watched == 0 {
                         library_item.removed = true;
@@ -538,46 +614,24 @@ impl<E: Env + 'static> UpdateWithCtx<E> for Player {
                         analytics_context.player_duration = Some(duration.to_owned());
                     };
 
-                    push_to_library::<E>(&mut self.push_library_item_time, library_item)
+                    let push_to_library_effects =
+                        push_to_library::<E>(&mut self.push_library_item_time, library_item);
+                    let intro_outro_effects = intro_outro_update::<E>(
+                        &mut self.intro_outro,
+                        &ctx.profile,
+                        self.selected.as_ref(),
+                        self.video_params.as_ref(),
+                        self.series_info.as_ref(),
+                        Some(library_item),
+                        &mut self.skip_gaps,
+                    );
+
+                    send_watched_effects
+                        .join(push_to_library_effects)
+                        .join(intro_outro_effects)
                 }
                 _ => Effects::none().unchanged(),
             },
-            Msg::Action(Action::Player(ActionPlayer::PausedChanged { paused }))
-                if self.selected.is_some() =>
-            {
-                self.paused = Some(*paused);
-                let trakt_event_effects = if !self.loaded {
-                    self.loaded = true;
-                    Effects::msg(Msg::Event(Event::PlayerPlaying {
-                        load_time: self
-                            .load_time
-                            .map(|load_time| {
-                                E::now().timestamp_millis() - load_time.timestamp_millis()
-                            })
-                            .unwrap_or(-1),
-                        context: self.analytics_context.as_ref().cloned().unwrap_or_default(),
-                    }))
-                    .unchanged()
-                } else if *paused {
-                    Effects::msg(Msg::Event(Event::TraktPaused {
-                        context: self.analytics_context.as_ref().cloned().unwrap_or_default(),
-                    }))
-                    .unchanged()
-                } else {
-                    Effects::msg(Msg::Event(Event::TraktPlaying {
-                        context: self.analytics_context.as_ref().cloned().unwrap_or_default(),
-                    }))
-                    .unchanged()
-                };
-                let update_library_item_effects = match &self.library_item {
-                    Some(library_item) => Effects::msg(Msg::Internal(Internal::UpdateLibraryItem(
-                        library_item.to_owned(),
-                    )))
-                    .unchanged(),
-                    _ => Effects::none().unchanged(),
-                };
-                trakt_event_effects.join(update_library_item_effects)
-            }
             Msg::Action(Action::Player(ActionPlayer::PausedChanged { paused }))
                 if self.selected.is_some() =>
             {
@@ -627,13 +681,14 @@ impl<E: Env + 'static> UpdateWithCtx<E> for Player {
                         .map(|library_item| library_item.state.time_offset),
                 );
 
-                // Set time_offset to 0 as we switch to next video
+                // Set time_offset to 0 or 1 as we switch to next video
                 let library_item_effects = self
                     .library_item
                     .as_mut()
                     .map(|library_item| {
                         // instantly update the library item's time_offset.
-                        library_item.state.time_offset = 0;
+                        library_item.state.time_offset =
+                            if self.next_video.is_some() { 1 } else { 0 };
 
                         Effects::msg(Msg::Internal(Internal::UpdateLibraryItem(
                             library_item.to_owned(),
@@ -714,8 +769,11 @@ impl<E: Env + 'static> UpdateWithCtx<E> for Player {
                     &ctx.library,
                 );
 
-                let library_item_state_effects =
-                    library_item_state_update(&mut self.library_item, &self.selected);
+                let library_item_state_effects = library_item_state_update(
+                    &mut self.library_item,
+                    self.next_video.as_ref(),
+                    &self.selected,
+                );
 
                 let watched_effects =
                     watched_update(&mut self.watched, &self.meta_item, &self.library_item);
@@ -778,7 +836,6 @@ impl<E: Env + 'static> UpdateWithCtx<E> for Player {
                     &self.next_stream,
                     &self.selected,
                     &self.meta_item,
-                    &ctx.profile.settings,
                 );
 
                 let next_streams_effects = next_streams_effects.join(next_streams_update::<E>(
@@ -787,12 +844,8 @@ impl<E: Env + 'static> UpdateWithCtx<E> for Player {
                     &self.selected,
                 ));
 
-                let next_stream_effects = next_stream_update(
-                    &mut self.next_stream,
-                    &self.next_streams,
-                    &self.selected,
-                    &ctx.profile.settings,
-                );
+                let next_stream_effects =
+                    next_stream_update(&mut self.next_stream, &self.next_streams, &self.selected);
 
                 let series_info_effects =
                     series_info_update(&mut self.series_info, &self.selected, &self.meta_item);
@@ -803,8 +856,11 @@ impl<E: Env + 'static> UpdateWithCtx<E> for Player {
                     &ctx.library,
                 );
 
-                let library_item_state_effects =
-                    library_item_state_update(&mut self.library_item, &self.selected);
+                let library_item_state_effects = library_item_state_update(
+                    &mut self.library_item,
+                    self.next_video.as_ref(),
+                    &self.selected,
+                );
 
                 let watched_effects =
                     watched_update(&mut self.watched, &self.meta_item, &self.library_item);
@@ -960,7 +1016,6 @@ fn next_video_update(
     stream: &Option<Stream>,
     selected: &Option<Selected>,
     meta_item: &Option<ResourceLoadable<MetaItem>>,
-    settings: &ProfileSettings,
 ) -> Effects {
     let next_video = match (selected, meta_item) {
         (
@@ -976,7 +1031,7 @@ fn next_video_update(
                 content: Some(Loadable::Ready(meta_item)),
                 ..
             }),
-        ) if settings.binge_watching => meta_item
+        ) => meta_item
             .videos
             .iter()
             .find_position(|video| video.id == *video_id)
@@ -1063,7 +1118,6 @@ fn next_stream_update(
     stream: &mut Option<Stream>,
     next_streams: &Option<ResourceLoadable<Vec<Stream>>>,
     selected: &Option<Selected>,
-    settings: &ProfileSettings,
 ) -> Effects {
     let next_stream = match (selected, next_streams) {
         (
@@ -1072,7 +1126,7 @@ fn next_stream_update(
                 content: Some(Loadable::Ready(streams)),
                 ..
             }),
-        ) if settings.binge_watching => streams
+        ) => streams
             .iter()
             .find(|next_stream| next_stream.is_binge_match(stream))
             .cloned(),
@@ -1170,6 +1224,7 @@ fn watched_update(
 
 fn library_item_state_update(
     library_item: &mut Option<LibraryItem>,
+    next_video: Option<&Video>,
     selected: &Option<Selected>,
 ) -> Effects {
     match (library_item, selected) {
@@ -1178,7 +1233,7 @@ fn library_item_state_update(
                 (Some(stream_request), Some(state_video_id))
                     if stream_request.path.id != *state_video_id =>
                 {
-                    library_item.state.time_offset = 0;
+                    library_item.state.time_offset = if next_video.is_some() { 1 } else { 0 };
                     Effects::msg(Msg::Internal(Internal::UpdateLibraryItem(
                         library_item.to_owned(),
                     )))
@@ -1190,37 +1245,96 @@ fn library_item_state_update(
     }
 }
 
+fn stream_update(
+    stream: &mut Option<Loadable<(StreamUrls, Stream<ConvertedStreamSource>), EnvError>>,
+    selected: Option<&Selected>,
+    streaming_server_url: &Url,
+) -> Effects {
+    match selected {
+        Some(selected) => {
+            let next_stream = match selected.stream.convert(Some(&streaming_server_url)) {
+                Ok(converted_stream) => {
+                    let stream_urls =
+                        StreamUrls::new(converted_stream.clone(), Some(&streaming_server_url));
+
+                    Loadable::Ready((stream_urls, converted_stream))
+                }
+                Err(err) => Loadable::Err(err),
+            };
+
+            eq_update(stream, Some(next_stream))
+        }
+        None => eq_update(stream, None),
+    }
+}
+
 fn subtitles_update<E: Env + 'static>(
     subtitles: &mut Vec<ResourceLoadable<Vec<Subtitles>>>,
     selected: &Option<Selected>,
     video_params: &Option<VideoParams>,
+    stream: Option<&Loadable<(StreamUrls, Stream<ConvertedStreamSource>), EnvError>>,
     addons: &[Descriptor],
 ) -> Effects {
-    match (selected, video_params) {
+    match (selected, stream) {
         (
             Some(Selected {
                 subtitles_path: Some(subtitles_path),
                 ..
             }),
-            Some(video_params),
-        ) => resources_update_with_vector_content::<E, _>(
-            subtitles,
-            ResourcesAction::force_request(
-                &AggrRequest::AllOfResource(ResourcePath {
-                    extra: subtitles_path
-                        .extra
-                        .to_owned()
-                        .extend_one(&VIDEO_HASH_EXTRA_PROP, video_params.hash.to_owned())
-                        .extend_one(
-                            &VIDEO_SIZE_EXTRA_PROP,
-                            video_params.size.as_ref().map(|size| size.to_string()),
-                        )
-                        .extend_one(&VIDEO_FILENAME_EXTRA_PROP, video_params.filename.to_owned()),
-                    ..subtitles_path.to_owned()
-                }),
-                addons,
-            ),
-        ),
+            Some(Loadable::Ready((_stream_urls, converted_stream))),
+        ) => {
+            let video_hash = converted_stream
+                .behavior_hints
+                .video_hash
+                .clone()
+                .or_else(|| {
+                    video_params
+                        .as_ref()
+                        .and_then(|video_params| video_params.hash.to_owned())
+                });
+            let video_size = converted_stream.behavior_hints.video_size.or_else(|| {
+                video_params
+                    .as_ref()
+                    .and_then(|video_params| video_params.size)
+            });
+            let video_filename =
+                converted_stream
+                    .behavior_hints
+                    .filename
+                    .to_owned()
+                    .or_else(|| {
+                        video_params
+                            .as_ref()
+                            .and_then(|video_params| video_params.filename.clone())
+                    });
+
+            if video_hash.is_none()
+                && video_size.is_none()
+                && video_filename.is_none()
+                && video_params.is_none()
+            {
+                return Effects::none().unchanged();
+            }
+
+            resources_update_with_vector_content::<E, _>(
+                subtitles,
+                ResourcesAction::request(
+                    &AggrRequest::AllOfResource(ResourcePath {
+                        extra: subtitles_path
+                            .extra
+                            .to_owned()
+                            .extend_one(&VIDEO_HASH_EXTRA_PROP, video_hash)
+                            .extend_one(
+                                &VIDEO_SIZE_EXTRA_PROP,
+                                video_size.map(|size| size.to_string()),
+                            )
+                            .extend_one(&VIDEO_FILENAME_EXTRA_PROP, video_filename),
+                        ..subtitles_path.to_owned()
+                    }),
+                    addons,
+                ),
+            )
+        }
         _ => eq_update(subtitles, vec![]),
     }
 }
@@ -1252,7 +1366,7 @@ fn seek_update<E: Env + 'static>(
                 selected.stream.name.as_ref(),
                 video_params.hash.clone(),
             ) {
-                (true, Some(stream_name), Some(opensubtitles_hash)) => {
+                (true, Some(stream_name), Some(os_hash)) => {
                     let stream_name_hash = {
                         use sha2::Digest;
                         let mut sha256 = sha2::Sha256::new();
@@ -1263,7 +1377,7 @@ fn seek_update<E: Env + 'static>(
                     };
 
                     let seek_log_req = SeekLogRequest {
-                        opensubtitles_hash,
+                        os_hash,
                         item_id: library_item.id.to_owned(),
                         series_info: series_info.to_owned(),
                         stream_name_hash,
@@ -1304,8 +1418,11 @@ fn calculate_outro(library_item: &LibraryItem, closest_duration: u64, closest_ou
     let duration_diff_in_secs =
         (library_item.state.duration.abs_diff(closest_duration)).div(1000 * 10) / 10;
     tracing::debug!(
+        closest_duration,
+        closest_outro,
         "Player: Outro match by duration with difference of {duration_diff_in_secs} seconds"
     );
+
     library_item
         .state
         .duration
@@ -1331,7 +1448,9 @@ fn intro_outro_update<E: Env + 'static>(
     );
 
     let intro_outro_effects = match (skip_gaps, library_item) {
-        (Some((_, Loadable::Ready(response))), Some(library_item)) => {
+        (Some((_, Loadable::Ready(response))), Some(library_item))
+            if library_item.state.duration > 0 =>
+        {
             let outro_time = {
                 let outro_durations = response.gaps.iter().filter_map(|(duration, skip_gaps)| {
                     skip_gaps.outro.map(|outro| (duration, outro))
@@ -1373,18 +1492,20 @@ fn intro_outro_update<E: Env + 'static>(
 
                 closest_duration.and_then(|(closest_duration, skip_gaps)| {
                 let duration_diff_in_secs = (library_item.state.duration.abs_diff(*closest_duration)).div(1000 * 10) / 10;
-                tracing::trace!("Player: Intro match by duration with difference of {duration_diff_in_secs} seconds");
-
                 let duration_ration = Ratio::new(library_item.state.duration, *closest_duration);
-
                 // even though we checked for len() > 0 make sure we don't panic if somebody decides to remove that check!
-                skip_gaps.seek_history.first().map(|seek_event| {
-                    IntroData {
+                let matched_intro = skip_gaps.seek_history.first().map(|seek_event| {
+                    let intro_data = IntroData {
                         from: (duration_ration * seek_event.from).to_integer(),
                         to: (duration_ration * seek_event.to).to_integer(),
                         duration: if duration_diff_in_secs > 0 { Some(seek_event.to.abs_diff(seek_event.from)) } else { None }
-                    }
-                })
+                    };
+                    tracing::debug!(?seek_event, ?intro_data, "Player: Intro match for event by duration with difference of {duration_diff_in_secs} seconds",);
+                    intro_data
+                })?;
+
+
+                Some(matched_intro)
               })
             };
 
@@ -1396,7 +1517,7 @@ fn intro_outro_update<E: Env + 'static>(
                 }),
             )
         }
-        _ => Effects::none().unchanged(),
+        _ => eq_update(intro_outro, None),
     };
 
     skip_gaps_effects.join(intro_outro_effects)
@@ -1441,7 +1562,7 @@ fn skip_gaps_update<E: Env + 'static>(
                 selected.stream.name.as_ref(),
                 video_params.hash.clone(),
             ) {
-                (true, Some(stream_name), Some(opensubtitles_hash)) => {
+                (true, Some(stream_name), Some(os_hash)) => {
                     let stream_name_hash = {
                         use sha2::Digest;
                         let mut sha256 = sha2::Sha256::new();
@@ -1453,7 +1574,7 @@ fn skip_gaps_update<E: Env + 'static>(
 
                     let skip_gaps_request = SkipGapsRequest {
                         auth_key,
-                        opensubtitles_hash,
+                        os_hash,
                         item_id: library_item.id.to_owned(),
                         series_info: series_info.to_owned(),
                         stream_name_hash,
@@ -1502,6 +1623,30 @@ fn get_skip_gaps<E: Env + 'static>(skip_gaps_request: SkipGapsRequest) -> Effect
     )
     .into()
 }
+
+/// Sends watched state for meta item on every Watched state change of the library item
+fn send_watched<E: Env + 'static>(auth_key: AuthKey, meta_path: &ResourcePath) -> Effect {
+    let meta_id = meta_path.id.to_owned();
+
+    let request = RatingSendRequest {
+        auth_key,
+        meta_item_id: meta_id.to_owned(),
+        meta_item_type: meta_path.r#type.to_owned(),
+        rating: Some(Rating::Watched),
+    };
+
+    EffectFuture::Concurrent(
+        E::fetch::<_, RatingSendResponse>(request.into())
+            .map(enclose::enclose!((meta_id) move |result| {
+                Msg::Internal(Internal::WatchedSendResult(
+                    meta_id, result,
+                ))
+            }))
+            .boxed_env(),
+    )
+    .into()
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::Utc;

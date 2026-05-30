@@ -136,8 +136,12 @@ impl Manifest {
                 };
                 let type_supported = types.is_some_and(|types| types.contains(&path.r#type));
                 let id_supported = id_prefixes.map_or(true, |id_prefixes| {
-                    id_prefixes.iter().any(|prefix| path.id.starts_with(prefix))
+                    // if prefixes are empty, all ids are supported
+                    id_prefixes.is_empty()
+                    // if we have prefixes, check if any match
+                        || id_prefixes.iter().any(|prefix| path.id.starts_with(prefix))
                 });
+
                 type_supported && id_supported
             }
         }
@@ -358,7 +362,7 @@ pub enum ManifestExtra {
 }
 
 impl ManifestExtra {
-    pub fn iter(&self) -> impl Iterator<Item = Cow<ExtraProp>> {
+    pub fn iter(&self) -> impl Iterator<Item = Cow<'_, ExtraProp>> {
         match &self {
             ManifestExtra::Full { props } => Either::Left(props.iter().map(Cow::Borrowed)),
             ManifestExtra::Short {

@@ -62,14 +62,12 @@ pub fn update_library<E: Env + 'static>(
                 library_item.temp = false;
 
                 // Dismiss any notification for the LibraryItem
-                let notifications_effects = if library_item.state.no_notif {
-                    Effects::msg(Msg::Internal(Internal::DismissNotificationItem(
-                        id.to_owned(),
-                    )))
-                    .unchanged()
-                } else {
-                    Effects::none().unchanged()
-                };
+                // whether no_notifs is enabled or not, we do not care.
+                // we will dismiss the notifs. and remove the item from CW.
+                let notifications_effects = Effects::msg(Msg::Internal(
+                    Internal::DismissNotificationItem(id.to_owned()),
+                ))
+                .unchanged();
 
                 Effects::msg(Msg::Internal(Internal::UpdateLibraryItem(library_item)))
                     .join(notifications_effects)
@@ -153,6 +151,18 @@ pub fn update_library<E: Env + 'static>(
                 }
                 _ => Effects::none().unchanged(),
             }
+        }
+        Msg::Action(Action::Ctx(ActionCtx::MetaItemMarkAsWatched {
+            meta_item,
+            is_watched,
+        })) => {
+            let mut library_item = match library.items.get(&meta_item.id) {
+                Some(library_item) => library_item.to_owned(),
+                _ if *is_watched => LibraryItem::from((meta_item, PhantomData::<E>)),
+                _ => return Effects::none().unchanged(),
+            };
+            library_item.mark_as_watched::<E>(*is_watched);
+            Effects::msg(Msg::Internal(Internal::UpdateLibraryItem(library_item))).unchanged()
         }
         Msg::Internal(Internal::UpdateLibraryItem(library_item))
             if library

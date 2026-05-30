@@ -25,7 +25,7 @@ jobs:
     steps:
 
     - name: Checkout
-      uses: actions/checkout@v4
+      uses: actions/checkout@v6
 
     # we use older stable version because our old version of `wasm-bindgen` is not compatible with >= 1.86
     - name: Rust setup (stable, 1.85)
@@ -52,14 +52,14 @@ jobs:
 
     env:
       NODE_VERSION: 12
-      WASM_PACK_VERSION: 0.13.1
-      RUST_VERSION: '1.77'
+      WASM_PACK_VERSION: 0.14.0
+      RUST_VERSION: '1.95'
     # No need to check core-web if core itself is not passing
     needs: build-core
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Rust setup
         uses: dtolnay/rust-toolchain@master
@@ -82,7 +82,7 @@ jobs:
         run: wasm-pack test --chromedriver "$(which chromedriver)" --chrome --headless
 
       - name: Setup NodeJS
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: "npm"

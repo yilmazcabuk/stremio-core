@@ -7,6 +7,8 @@ use percent_encoding::utf8_percent_encode;
 use std::str::FromStr;
 use url::Url;
 
+const DOWNLOAD_TORRENT_STR_URL: &str =
+    "http://127.0.0.1:11470/dd8255ecdc7ca55fb0bbf81323d87062db1f6d1c/0?external=1&download=1";
 const MAGNET_STR_URL: &str = "magnet:?xt=urn:btih:dd8255ecdc7ca55fb0bbf81323d87062db1f6d1c&tr=http%3A%2F%2Fbt1.archive.org%3A6969%2Fannounce";
 const HTTP_STR_URL: &str = "http://domain.root/path";
 const BASE64_HTTP_URL: &str = "data:application/octet-stream;charset=utf-8;base64,I0VYVE0zVQojRVhUSU5GOjAKaHR0cDovL2RvbWFpbi5yb290L3BhdGg=";
@@ -26,8 +28,9 @@ fn external_player_link_magnet() {
     };
     let streaming_server_url = Some(Url::parse(STREAMING_SERVER_URL).unwrap());
     let settings = Settings::default();
-    let epl = ExternalPlayerLink::from((&stream, &streaming_server_url, &settings));
-    assert_eq!(epl.download, Some(MAGNET_STR_URL.to_owned()));
+    let epl = ExternalPlayerLink::from((&stream, streaming_server_url.as_ref(), &settings));
+    assert_eq!(epl.download, None);
+    assert_eq!(epl.magnet, Some(MAGNET_STR_URL.to_owned()));
     assert_eq!(epl.file_name, None);
 }
 
@@ -45,7 +48,7 @@ fn external_player_link_http() {
     };
     let streaming_server_url = Some(Url::parse(STREAMING_SERVER_URL).unwrap());
     let settings = Settings::default();
-    let epl = ExternalPlayerLink::from((&stream, &streaming_server_url, &settings));
+    let epl = ExternalPlayerLink::from((&stream, streaming_server_url.as_ref(), &settings));
     assert_eq!(epl.playlist, Some(BASE64_HTTP_URL.to_owned()));
     assert_eq!(epl.file_name, Some("playlist.m3u".to_string()));
 }
@@ -73,7 +76,7 @@ fn external_player_link_torrent() {
     };
     let streaming_server_url = Some(Url::parse(STREAMING_SERVER_URL).unwrap());
     let settings = Settings::default();
-    let epl = ExternalPlayerLink::from((&stream, &streaming_server_url, &settings));
+    let epl = ExternalPlayerLink::from((&stream, streaming_server_url.as_ref(), &settings));
     assert_eq!(
         epl.playlist,
         Some(format!(
@@ -93,7 +96,7 @@ fn external_player_link_torrent() {
             ))
         ))
     );
-    assert_eq!(epl.download, Some(MAGNET_STR_URL.to_owned()));
+    assert_eq!(epl.download, Some(DOWNLOAD_TORRENT_STR_URL.to_owned()));
     assert_eq!(epl.file_name, Some("playlist.m3u".to_string()));
 }
 
@@ -114,7 +117,7 @@ fn external_player_link_external() {
     };
     let streaming_server_url = Some(Url::parse(STREAMING_SERVER_URL).unwrap());
     let settings = Settings::default();
-    let epl = ExternalPlayerLink::from((&stream, &streaming_server_url, &settings));
+    let epl = ExternalPlayerLink::from((&stream, streaming_server_url.as_ref(), &settings));
     assert_eq!(epl.web, Some(Url::from_str(HTTP_STR_URL).unwrap()));
     assert_eq!(epl.file_name, None);
 }
@@ -134,7 +137,7 @@ fn external_player_link_youtube() {
     };
     let streaming_server_url = Some(Url::parse(STREAMING_SERVER_URL).unwrap());
     let settings = Settings::default();
-    let epl = ExternalPlayerLink::from((&stream, &streaming_server_url, &settings));
+    let epl = ExternalPlayerLink::from((&stream, streaming_server_url.as_ref(), &settings));
     assert_eq!(
         epl.playlist,
         Some(format!(
@@ -162,7 +165,7 @@ fn external_player_link_player_frame() {
     };
     let streaming_server_url = Some(Url::parse(STREAMING_SERVER_URL).unwrap());
     let settings = Settings::default();
-    let epl = ExternalPlayerLink::from((&stream, &streaming_server_url, &settings));
+    let epl = ExternalPlayerLink::from((&stream, streaming_server_url.as_ref(), &settings));
     assert_eq!(epl.playlist, None);
     assert_eq!(epl.file_name, None);
 }
@@ -319,6 +322,40 @@ fn external_player_link_with_infuse() {
 
     assert_eq!(
         open_player.ios,
-        Some("infuse://x-callback-url/play?url=http%3A%2F%2Fexample.com%2Fstream".to_string())
+        Some("infuse://x-callback-url/play?x-success=stremio%3A%2F%2F%2Fplayer%3FexternalPlayerSuccess%3D1&x-error=stremio%3A%2F%2F%2Fplayer%3FexternalPlayerSuccess%3D0&url=http%3A%2F%2Fexample.com%2Fstream".to_string())
+    );
+}
+
+#[test]
+fn external_player_link_and_callback_with_vidhub() {
+    let stream = Stream {
+        source: StreamSource::Url {
+            url: Url::from_str("http://example.com/stream").unwrap(),
+        },
+        name: None,
+        description: None,
+        thumbnail: None,
+        subtitles: vec![],
+        behavior_hints: Default::default(),
+    };
+
+    let streaming_server_url = Some(Url::parse(STREAMING_SERVER_URL).unwrap());
+
+    let settings = Settings {
+        player_type: Some("vidhub".to_string()),
+        streaming_server_url: Url::parse(STREAMING_SERVER_URL).unwrap(),
+        ..Default::default()
+    };
+
+    let epl = ExternalPlayerLink::from((&stream, streaming_server_url.as_ref(), &settings));
+
+    let open_player = epl.open_player.as_ref().unwrap();
+
+    assert_eq!(
+        open_player.ios,
+        Some(
+            "open-vidhub://x-callback-url/open?on-success=stremio%3A%2F%2F%2Fplayer%3FexternalPlayerSuccess%3D1&on-failed=stremio%3A%2F%2F%2Fplayer%3FexternalPlayerSuccess%3D0&url=http%3A%2F%2Fexample.com%2Fstream"
+                .to_string()
+        )
     );
 }

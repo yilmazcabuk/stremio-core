@@ -14,6 +14,8 @@ use crate::types::api::{
 };
 use crate::types::library::{LibraryBucket, LibraryItem, LibraryItemId};
 use crate::types::profile::{Auth, AuthKey, Profile, User};
+use crate::types::rating::{RatingGetStatusResponse, RatingSendResponse};
+use crate::types::resource::MetaItemId;
 use crate::types::streaming_server::{
     DeviceInfo, GetHTTPSResponse, NetworkInfo, SettingsResponse, Statistics, StatisticsRequest,
 };
@@ -48,7 +50,14 @@ pub enum Internal {
     /// Result for pull addons from API.
     AddonsAPIResult(APIRequest, Result<Vec<Descriptor>, CtxError>),
     /// Result for pull user from API.
-    UserAPIResult(APIRequest, Result<User, CtxError>),
+    UserAPIResult {
+        request: APIRequest,
+        result: Result<User, CtxError>,
+        /// In case we want to use a token directly to pull user data from the API.
+        ///
+        /// The field indicates whether or not we have overwritten the token from the profile
+        overwritten: bool,
+    },
     /// Result for deleting account from API.
     DeleteAccountAPIResult(APIRequest, Result<SuccessResponse, CtxError>),
     /// Result for library sync plan with API.
@@ -157,4 +166,11 @@ pub enum Internal {
     ),
     /// When dismissed events changed
     DismissedEventsChanged,
+    RatingGetStatusResult(MetaItemId, Result<RatingGetStatusResponse, EnvError>),
+    RatingSendResult(MetaItemId, Result<RatingSendResponse, EnvError>),
+    /// Internal to core, sends the watched update when needed:
+    /// Mark video as watched
+    /// Mark Season as watched (meta item)
+    /// Mark move as watched (meta item)
+    WatchedSendResult(MetaItemId, Result<RatingSendResponse, EnvError>),
 }

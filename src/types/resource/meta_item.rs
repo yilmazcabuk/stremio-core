@@ -28,6 +28,8 @@ use crate::types::{NumberAsString, SortedVec, SortedVecAdapter, UniqueVec, Uniqu
 /// For example when using the id as key in a [`HashMap`].
 pub type MetaItemId = String;
 
+pub type MetaItemType = String;
+
 #[derive(Clone, PartialEq, Deserialize, Debug)]
 #[cfg_attr(test, derive(Default))]
 struct Trailer {
@@ -326,7 +328,7 @@ pub struct Video {
 }
 
 impl Video {
-    pub fn stream(&self) -> Option<Cow<Stream>> {
+    pub fn stream(&self) -> Option<Cow<'_, Stream>> {
         self.streams
             .iter()
             .exactly_one()
