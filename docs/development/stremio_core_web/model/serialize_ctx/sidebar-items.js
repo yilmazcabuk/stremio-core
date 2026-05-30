@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["serialize_ctx"],"mod":["model"],"struct":["Auth","Ctx","Notifications","Profile","SearchHistoryItem","StreamingServerUrlItem","User"]};

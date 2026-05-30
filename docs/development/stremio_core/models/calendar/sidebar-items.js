@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["items_update","meta_items_update","month_info_update","selectable_update","selected_update"],"struct":["Calendar","ContentItem","FullDate","Item","MonthInfo","Selectable","YearMonthDate"],"type":["Day","Month","Selected","Year"]};

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["DispatchError","GetStateError","State"],"fn":["analytics","decode_stream","dispatch","encode_stream","get_debug_state","get_state","initialize_runtime","start","stringify"],"mod":["env","event","model","stremio_core_web"]};
